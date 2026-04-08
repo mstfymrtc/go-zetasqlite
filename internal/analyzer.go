@@ -547,14 +547,14 @@ func (a *Analyzer) newTruncateStmtAction(_ context.Context, _ string, _ []driver
 	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM `%s`", table)}, nil
 }
 
-// columnPair represents a pair of source and target columns for MERGE ON conditions
+// columnPair represents a pair of source and target columns for MERGE ON conditions.
 type columnPair struct {
 	sourceColumn *ast.Column
 	targetColumn *ast.Column
 }
 
-// extractEqualityPairs recursively extracts column pairs from MERGE ON expression
-// Supports both single equality (a = b) and multiple AND conditions (a = b AND c = d)
+// extractEqualityPairs recursively extracts column pairs from MERGE ON expression.
+// Supports both single equality (a = b) and multiple AND conditions (a = b AND c = d).
 func extractEqualityPairs(node ast.ExprNode, sourceTable string) ([]columnPair, error) {
 	fn, ok := node.(*ast.FunctionCallNode)
 	if !ok {
@@ -605,7 +605,8 @@ func extractEqualityPairs(node ast.ExprNode, sourceTable string) ([]columnPair, 
 	}
 }
 
-// extractTableNameFromSQL extracts the SQLite table name from formatted SQL like "(SELECT ... FROM `tablename`)"
+// extractTableNameFromSQL extracts the SQLite table name from formatted SQL like "(SELECT ... FROM `tablename`)".
+
 func extractTableNameFromSQL(sql string) string {
 	// Find "FROM `" and extract table name
 	fromIdx := strings.Index(sql, "FROM `")
@@ -620,7 +621,7 @@ func extractTableNameFromSQL(sql string) string {
 	return sql[start : start+end]
 }
 
-func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driver.NamedValue, node *ast.MergeStmtNode) (*MergeStmtAction, error) {
+func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, _ []driver.NamedValue, node *ast.MergeStmtNode) (*MergeStmtAction, error) {
 	targetTable, err := newNode(node.TableScan()).FormatSQL(ctx)
 	if err != nil {
 		return nil, err
@@ -649,29 +650,25 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		return nil, fmt.Errorf("MERGE expression must have at least one equality condition")
 	}
 
-	// Build column name lists for merged table
-	var mergedTableOutputColumns []string
-	// Collect all NULL checks for each match type
-	var srcNullChecks []string  // Check source columns are NULL (for not matched by target check)
-	var tgtNullChecks []string  // Check target columns are NULL (for not matched by source check)
-	var srcNotNullChecks []string // Check source columns are NOT NULL
-	var tgtNotNullChecks []string // Check target columns are NOT NULL
-	// Join conditions to correlate target table with merged table (for UPDATE/DELETE)
+	// Collect all NULL checks for each match type.
+	var srcNullChecks []string
+	var tgtNullChecks []string
+	var srcNotNullChecks []string
+	var tgtNotNullChecks []string
+	// Join conditions to correlate target table with merged table (for UPDATE/DELETE).
 	var targetJoinConditions []string
 
 	for _, pair := range pairs {
 		srcColName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, pair.sourceColumn))
 		tgtColName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, pair.targetColumn))
-		// Bare target column name for joining target table to merged table
+		// Bare target column name for joining target table to merged table.
 		bareTargetColName := fmt.Sprintf("`%s`", pair.targetColumn.Name())
-
-		mergedTableOutputColumns = append(mergedTableOutputColumns, tgtColName, srcColName)
 
 		srcNullChecks = append(srcNullChecks, fmt.Sprintf("%s IS NULL", srcColName))
 		tgtNullChecks = append(tgtNullChecks, fmt.Sprintf("%s IS NULL", tgtColName))
 		srcNotNullChecks = append(srcNotNullChecks, fmt.Sprintf("%s IS NOT NULL", srcColName))
 		tgtNotNullChecks = append(tgtNotNullChecks, fmt.Sprintf("%s IS NOT NULL", tgtColName))
-		// Join target table's column to merged table's target column
+		// Join target table's column to merged table's target column.
 		targetJoinConditions = append(targetJoinConditions, fmt.Sprintf("`%s`.%s = zetasqlite_merged_table.%s", targetTableName, bareTargetColName, tgtColName))
 	}
 
@@ -681,21 +678,21 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 		sourceTable, targetTable, expr,
 	))
 
-	// exists target table and source table (matched rows have all columns non-null)
+	// Exists target table and source table (matched rows have all columns non-null).
 	matchedFromStmt := fmt.Sprintf(
 		"FROM zetasqlite_merged_table WHERE %s AND %s",
 		strings.Join(srcNotNullChecks, " AND "),
 		strings.Join(tgtNotNullChecks, " AND "),
 	)
 
-	// exists target table but not exists source table (target columns exist, source columns are NULL)
+	// Exists target table but not exists source table (target columns exist, source columns are NULL).
 	notMatchedBySourceFromStmt := fmt.Sprintf(
 		"FROM zetasqlite_merged_table WHERE %s AND %s",
 		strings.Join(tgtNotNullChecks, " AND "),
 		strings.Join(srcNullChecks, " AND "),
 	)
 
-	// exists source table but not exists target table (source columns exist, target columns are NULL)
+	// Exists source table but not exists target table (source columns exist, target columns are NULL).
 	notMatchedByTargetFromStmt := fmt.Sprintf(
 		"FROM zetasqlite_merged_table WHERE %s AND %s",
 		strings.Join(srcNotNullChecks, " AND "),
@@ -722,8 +719,8 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 			if err != nil {
 				return nil, err
 			}
-			// For INSERT, select directly from merged table where target columns are NULL
-			// The merged table already contains the source rows that didn't match
+			// For INSERT, select directly from merged table where target columns are NULL.
+			// The merged table already contains the source rows that didn't match.
 			stmts = append(stmts, fmt.Sprintf(
 				"INSERT INTO `%[1]s`(%[2]s) SELECT %[3]s %[4]s",
 				targetTableName,
@@ -738,8 +735,8 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 				if err != nil {
 					return nil, err
 				}
-				// The format is `col`=`val#N` - we need to make it `col`=(SELECT `val#N` FROM merged WHERE join_conditions)
-				// Split on = to get column and value
+				// The format is `col`=`val#N` - we need to make it `col`=(SELECT `val#N` FROM merged WHERE join_conditions).
+				// Split on = to get column and value.
 				parts := strings.SplitN(sql, "=", 2)
 				if len(parts) == 2 {
 					col := strings.TrimSpace(parts[0])
@@ -751,7 +748,7 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 					setItems = append(setItems, sql)
 				}
 			}
-			// Use correlated UPDATE with EXISTS for WHERE
+			// Use correlated UPDATE with EXISTS for WHERE.
 			whereConditions := strings.TrimPrefix(fromStmt, "FROM zetasqlite_merged_table WHERE ")
 			stmts = append(stmts, fmt.Sprintf(
 				"UPDATE `%[1]s` SET %[2]s WHERE EXISTS(SELECT 1 FROM zetasqlite_merged_table WHERE %[3]s AND %[4]s)",
@@ -761,7 +758,7 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 				whereConditions,
 			))
 		case ast.ActionTypeDelete:
-			// DELETE also needs to join target table to merged table
+			// DELETE also needs to join target table to merged table.
 			whereConditions := strings.TrimPrefix(fromStmt, "FROM zetasqlite_merged_table WHERE ")
 			stmts = append(stmts, fmt.Sprintf(
 				"DELETE FROM `%[1]s` WHERE EXISTS(SELECT 1 FROM zetasqlite_merged_table WHERE %[2]s AND %[3]s)",
