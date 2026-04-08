@@ -547,6 +547,64 @@ func (a *Analyzer) newTruncateStmtAction(_ context.Context, _ string, _ []driver
 	return &TruncateStmtAction{query: fmt.Sprintf("DELETE FROM `%s`", table)}, nil
 }
 
+// columnPair represents a pair of source and target columns for MERGE ON conditions
+type columnPair struct {
+	sourceColumn *ast.Column
+	targetColumn *ast.Column
+}
+
+// extractEqualityPairs recursively extracts column pairs from MERGE ON expression
+// Supports both single equality (a = b) and multiple AND conditions (a = b AND c = d)
+func extractEqualityPairs(node ast.ExprNode, sourceTable string) ([]columnPair, error) {
+	fn, ok := node.(*ast.FunctionCallNode)
+	if !ok {
+		return nil, fmt.Errorf("MERGE expression must be equality or AND of equalities, got %T", node)
+	}
+
+	funcName := fn.Function().FullName(false)
+
+	switch funcName {
+	case "$and":
+		// Recursively extract from both sides of AND
+		var pairs []columnPair
+		for _, arg := range fn.ArgumentList() {
+			subPairs, err := extractEqualityPairs(arg, sourceTable)
+			if err != nil {
+				return nil, err
+			}
+			pairs = append(pairs, subPairs...)
+		}
+		return pairs, nil
+
+	case "$equal":
+		argList := fn.ArgumentList()
+		if len(argList) != 2 {
+			return nil, fmt.Errorf("equality expression must have 2 arguments, got %d", len(argList))
+		}
+		colA, ok := argList[0].(*ast.ColumnRefNode)
+		if !ok {
+			return nil, fmt.Errorf("MERGE expression expected column reference, got %T", argList[0])
+		}
+		colB, ok := argList[1].(*ast.ColumnRefNode)
+		if !ok {
+			return nil, fmt.Errorf("MERGE expression expected column reference, got %T", argList[1])
+		}
+
+		var pair columnPair
+		if strings.Contains(sourceTable, colA.Column().TableName()) {
+			pair.sourceColumn = colA.Column()
+			pair.targetColumn = colB.Column()
+		} else {
+			pair.sourceColumn = colB.Column()
+			pair.targetColumn = colA.Column()
+		}
+		return []columnPair{pair}, nil
+
+	default:
+		return nil, fmt.Errorf("MERGE expression must be equality or AND of equalities, got %s", funcName)
+	}
+}
+
 func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driver.NamedValue, node *ast.MergeStmtNode) (*MergeStmtAction, error) {
 	targetTable, err := newNode(node.TableScan()).FormatSQL(ctx)
 	if err != nil {
@@ -560,42 +618,46 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 	if err != nil {
 		return nil, err
 	}
-	fn, ok := node.MergeExpr().(*ast.FunctionCallNode)
-	if !ok {
-		return nil, fmt.Errorf("currently MERGE expression is supported equal expression only")
+
+	// Extract all equality pairs from the MERGE ON expression
+	pairs, err := extractEqualityPairs(node.MergeExpr(), sourceTable)
+	if err != nil {
+		return nil, err
 	}
-	if fn.Function().FullName(false) != "$equal" {
-		return nil, fmt.Errorf("currently MERGE expression is supported equal expression only")
+	if len(pairs) == 0 {
+		return nil, fmt.Errorf("MERGE expression must have at least one equality condition")
 	}
-	argList := fn.ArgumentList()
-	if len(argList) != 2 {
-		return nil, fmt.Errorf("unexpected MERGE expression column num. expected 2 column but specified %d column", len(args))
+
+	// Build column name lists for merged table
+	var mergedTableOutputColumns []string
+	var matchedConditions []string
+	var notMatchedBySourceConditions []string
+	var notMatchedByTargetConditions []string
+
+	for _, pair := range pairs {
+		srcColName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, pair.sourceColumn))
+		tgtColName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, pair.targetColumn))
+
+		mergedTableOutputColumns = append(mergedTableOutputColumns, tgtColName, srcColName)
+
+		// For matched: both source and target columns match
+		matchedConditions = append(matchedConditions,
+			fmt.Sprintf("%s = %s AND %s = %s", srcColName, pair.targetColumn.Name(), tgtColName, pair.targetColumn.Name()))
+
+		// For not matched by source: target exists but source is NULL
+		notMatchedBySourceConditions = append(notMatchedBySourceConditions,
+			fmt.Sprintf("%s = `%s`", tgtColName, pair.targetColumn.Name()))
+
+		// For not matched by target: source exists but target is NULL
+		notMatchedByTargetConditions = append(notMatchedByTargetConditions,
+			fmt.Sprintf("%s = `%s`", srcColName, pair.sourceColumn.Name()))
 	}
-	colA, ok := argList[0].(*ast.ColumnRefNode)
-	if !ok {
-		return nil, fmt.Errorf("unexpected MERGE expression. expected column reference but got %T", argList[0])
-	}
-	colB, ok := argList[1].(*ast.ColumnRefNode)
-	if !ok {
-		return nil, fmt.Errorf("unexpected MERGE expression. expected column reference but got %T", argList[1])
-	}
-	var (
-		sourceColumn *ast.Column
-		targetColumn *ast.Column
-	)
-	if strings.Contains(sourceTable, colA.Column().TableName()) {
-		sourceColumn = colA.Column()
-		targetColumn = colB.Column()
-	} else {
-		sourceColumn = colB.Column()
-		targetColumn = colA.Column()
-	}
-	mergedTableSourceColumnName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, sourceColumn))
-	mergedTableTargetColumnName := fmt.Sprintf("`%s`", uniqueColumnName(ctx, targetColumn))
-	mergedTableOutputColumns := []string{
-		mergedTableTargetColumnName,
-		mergedTableSourceColumnName,
-	}
+
+	// Add NULL checks for not matched conditions (check first pair's columns)
+	firstPair := pairs[0]
+	srcColNameFirst := fmt.Sprintf("`%s`", uniqueColumnName(ctx, firstPair.sourceColumn))
+	tgtColNameFirst := fmt.Sprintf("`%s`", uniqueColumnName(ctx, firstPair.targetColumn))
+
 	var stmts []string
 	stmts = append(stmts, fmt.Sprintf(
 		"CREATE TABLE zetasqlite_merged_table AS SELECT DISTINCT * FROM (SELECT * FROM %[1]s LEFT JOIN %[2]s ON %[3]s UNION ALL SELECT * FROM %[2]s LEFT JOIN %[1]s ON %[3]s)",
@@ -604,27 +666,27 @@ func (a *Analyzer) newMergeStmtAction(ctx context.Context, _ string, args []driv
 
 	// exists target table and source table
 	matchedFromStmt := fmt.Sprintf(
-		"FROM zetasqlite_merged_table WHERE %[2]s = %[1]s AND %[3]s = %[1]s",
-		targetColumn.Name(),
-		mergedTableSourceColumnName,
-		mergedTableTargetColumnName,
+		"FROM zetasqlite_merged_table WHERE %s",
+		strings.Join(matchedConditions, " AND "),
 	)
 
 	// exists target table but not exists source table
 	notMatchedBySourceFromStmt := fmt.Sprintf(
-		"FROM zetasqlite_merged_table WHERE %[2]s = `%[1]s` AND %[3]s IS NULL",
-		targetColumn.Name(),
-		mergedTableTargetColumnName,
-		mergedTableSourceColumnName,
+		"FROM zetasqlite_merged_table WHERE %s AND %s IS NULL",
+		strings.Join(notMatchedBySourceConditions, " AND "),
+		srcColNameFirst,
 	)
 
 	// exists source table but not exists target table
 	notMatchedByTargetFromStmt := fmt.Sprintf(
-		"FROM zetasqlite_merged_table WHERE %[2]s = `%[1]s` AND %[3]s IS NULL",
-		sourceColumn.Name(),
-		mergedTableSourceColumnName,
-		mergedTableTargetColumnName,
+		"FROM zetasqlite_merged_table WHERE %s AND %s IS NULL",
+		strings.Join(notMatchedByTargetConditions, " AND "),
+		tgtColNameFirst,
 	)
+
+	// Use first pair's columns for backwards compatibility with existing code
+	sourceColumn := firstPair.sourceColumn
+	targetColumn := firstPair.targetColumn
 	for _, when := range node.WhenClauseList() {
 		var fromStmt string
 		switch when.MatchType() {
